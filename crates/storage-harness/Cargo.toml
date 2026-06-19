@@ -1,0 +1,13 @@
+[package]
+name = "storage-harness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-bus = { path = "../harness-bus" }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

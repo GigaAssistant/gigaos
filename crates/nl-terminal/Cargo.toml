@@ -1,0 +1,21 @@
+[package]
+name = "nl-terminal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gigaos"
+path = "src/main.rs"
+
+[dependencies]
+harness-bus = { path = "../harness-bus" }
+storage-harness = { path = "../storage-harness" }
+ai-service = { path = "../ai-service" }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -40,6 +40,7 @@ through the bus.
 - `crates/nl-terminal` — minimal NL input loop: read line → Claude API → bus dispatch → print result
 - Integration test: assert dispatch path went `terminal → bus → storage-harness → result`
   (NOT `terminal → std::fs → result` — the test must instrument the bus)
+- **Langfuse tracing** — every `infer()` call and every bus dispatch emits a trace; observable from session one
 
 **Acceptance criteria:**
 - [ ] `cargo build` — zero errors, zero warnings
@@ -50,6 +51,11 @@ through the bus.
 **M1 AI backend: Claude API hardcoded.** Local inference setup is M4. If "AI service" means
 "stand up local Qwen," the estimate explodes. Pin the backend to Claude API until the bus
 abstraction is proven.
+
+**M1 observability: Langfuse required.** Every inference call and bus dispatch is traced.
+Not a nice-to-have — this is the observable reduction history that makes debugging possible.
+If the trace isn't wired, the bus is a black box and integration tests lose their primary
+diagnostic tool.
 
 **Lambda check:**
 - Minimality: storage harness and AI service are irreducible — neither can be composed from the other
@@ -175,19 +181,64 @@ boots directly into the GigaOS experience.
 
 ---
 
-## GPU Tier (Giga²OS) — Parallel Track from M4
+## GPU Tier Roadmap — Parallel Track from M4
 
-The Supercharged tier — a large local model on a GPU box — is enabled by the Linux base
-(CUDA drivers already exist) and wires in at the AiService slot.
+All four tiers share the same harness bus, NL terminal, and NixOS base. Only the `AiService`
+backend changes. Upgrades are substitutions at the slot — no harness rewrites, no capability
+changes.
 
-This track can run in parallel with M5/M6:
-- Large local model running in Ollama / vLLM on the GPU machine
-- `LocalGpuService` impl of `AiService` trait
-- Same harness bus, same capability model, same NL terminal — different backend
-- Base tier (Mac mini / no GPU) degrades gracefully to Claude API
+### Tier 0 — GigaOS (CPU)
+**Backend:** Claude API (remote inference)  
+**Hardware:** Any machine. Mac mini M4 Pro is the reference platform.  
+**Ships:** M6 (base appliance image)  
+**NixOS config:** `services.gigaos.aiBackend = "claude-api";`
 
-The CUDA/ROCm story depends on the BASE_LAYER.md choice (see that doc — GPU inference is
-the deciding variable for base layer selection).
+The base tier. No local inference required. The system is fully functional with network access
+to the Claude API. Degrades gracefully without network: `NullAiService` + all deterministic
+harness operations continue working.
+
+### Tier 1 — GigaOS+ (Local 14B)
+**Backend:** Ollama 14B (e.g., Qwen3-14B or Mistral-14B) running locally  
+**Hardware:** 16GB+ RAM, modern CPU. No GPU required (runs on CPU with Ollama).  
+**Ships:** Post-M6, parallel with M5  
+**NixOS config:** `services.gigaos.aiBackend = "ollama-14b";`
+
+Adds low-latency local inference for fast-path operations (intent classification, short
+completions, routine dispatch). Claude API remains the fallback for complex reasoning.
+Two-tier routing lives in the `OllamaService` impl — callers see a single `AiService`.
+
+### Tier 2 — Giga²OS (Local 70B GPU)
+**Backend:** vLLM running a 70B parameter model (e.g., Qwen-72B, Llama-3-70B)  
+**Hardware:** NVIDIA GPU, A100/RTX 3090 class. CUDA required.  
+**Ships:** Post-M6, after `gigaos-gpu` NixOS image validated in CI  
+**NixOS config:** `services.gigaos.aiBackend = "vllm-70b"; nixpkgs.config.allowUnfree = true;`
+
+Full local inference for all operations. Claude API becomes optional fallback only.
+The `gigaos-gpu` appliance image (NixOS with CUDA overlay, pinned driver version) is the
+build target. CUDA finickiness is quarantined to this image — it does not affect Tier 0/1.
+
+### Tier 3 — Giga³OS (Multi-GPU)
+**Backend:** Tensor-parallel inference across multiple GPUs  
+**Hardware:** Multi-GPU rack. Enterprise inference class.  
+**Ships:** Research / future  
+**NixOS config:** TBD based on inference framework chosen at Tier 2
+
+Same harness interface as all other tiers. Multi-GPU parallelism is internal to the
+`AiService` impl. The bus sees a single slot.
+
+---
+
+### GPU Tier Migration Path
+
+```
+GigaOS (Tier 0)  →  GigaOS+ (Tier 1)  →  Giga²OS (Tier 2)  →  Giga³OS (Tier 3)
+   Claude API          Ollama 14B            vLLM 70B            Multi-GPU
+   Any machine         16GB RAM              GPU required         GPU rack
+   Ships M6            Post-M6               Post-M6              Future
+```
+
+Each step is an `AiService` backend substitution. Downgrade is always possible — the system
+always runs at Tier 0 capability with Claude API access.
 
 ---
 

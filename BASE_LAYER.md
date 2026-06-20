@@ -1,13 +1,52 @@
 # GigaOS — Base Layer Decision
-Version: 0.1 (Open Decision)
-Date: 2026-06-19
+Version: 0.2 (Resolved)
+Date: 2026-06-20
 
-This document is an open decision. It must be resolved before Milestone 6 (Appliance Image).
-It does not block M1 through M5. Track progress: fill in the "Decision" field below when made.
+This document records the base layer decision made on 2026-06-20.
+It does not block M1 through M5. M6 (Appliance Image) can now proceed.
 
-**Decision:** PENDING  
-**Blocking:** M6 (Appliance Image)  
+**Decision:** NixOS  
+**Blocking:** M6 (Appliance Image) — now unblocked  
 **Deciding axis:** GPU/CUDA inference support (see below)
+
+---
+
+## Decision Record
+
+**Decided:** 2026-06-20
+
+**Rationale:**
+NixOS is the architecturally isomorphic choice for GigaOS. A NixOS system is defined as a pure
+function of its configuration — this is the Substitution Semantics guardrail and Minimality guardrail
+made literal at the OS layer. NixOS generations align directly with GigaOS's own state model (new
+generation per operation, gc is the only destructive act, rollback is free). The existing GigaNixOS
+VM at 192.168.1.148 gives us a live reference that shortens setup time significantly. The CUDA path
+is "annoying, not blocking" — the GPU tier is post-M6 scope, so the finicky CUDA story on NixOS
+does not land on the M6 critical path.
+
+**CUDA plan:**
+GPU inference is a parallel track (Giga²OS, M4+). It is NOT a M6 requirement. Two appliance
+variants will exist: `gigaos` (CPU-only, stable NixOS channel) and `gigaos-gpu` (CUDA via
+nixpkgs CUDA overlay, `NIXPKGS_ALLOW_UNFREE=1`, driver version pinned in flake inputs).
+The `gigaos` image ships first. `gigaos-gpu` is validated in CI against a CUDA-capable machine
+before merging. CUDA finickiness is quarantined to a separate build target — it cannot break
+the base image.
+
+**Atomic update plan:**
+NixOS generations. Every system update produces a new generation — same model as GigaOS's own
+persistence. Roll back is `nixos-rebuild switch --rollback`. The appliance image is a NixOS
+flake; `nixos-rebuild switch` is the update mechanism. No ostree, no rpm-ostree.
+
+**First-boot wizard plan:**
+Custom NixOS-based installer. The boot manifest (HARNESS_SPEC.md) maps cleanly to NixOS module
+options (`services.gigaos.enable = true;`). Calamares is available as a fallback but the target
+is a purpose-built installer that takes the AI backend selection and outputs a NixOS config.
+This is M6 scope — not designed during M1–M5.
+
+**NixOS as harness manifest:**
+The harness boot manifest (which declares which harnesses load at startup) will be expressed as
+NixOS module options. This makes the OS config and the harness config the same artifact.
+`nix develop` provides the reproducible dev shell. The appliance IS the NixOS config.
 
 ---
 
@@ -105,17 +144,15 @@ Pick based on when you need GPU support to be production-ready, not on philosoph
 
 ---
 
-## What to Decide
+## NixOS Reference
 
-Answer these questions to resolve the decision:
+- Active GigaNixOS VM: `192.168.1.148` / Tailscale `100.122.2.51` — NixOS 25.05
+- Dev shell: `nix develop` in the gigaos workspace root
+- `services.gigaos.enable = true;` is the target NixOS module declaration for the appliance
+- CUDA overlay: `nixpkgs.config.allowUnfree = true;` + `environment.systemPackages = [ pkgs.cudatoolkit ];`
 
-1. **GPU tier timing:** Does M6 ship with GPU inference support, or is that a post-M6 upgrade?
-2. **Installer investment:** Are you willing to write a custom NixOS installer, or does Anaconda handle it?
-3. **Team familiarity:** Is the GigaNixOS config experience sufficient to build an appliance config from scratch?
+## Closed Questions
 
-When answered, fill in:
-- **Decision:** [Silverblue | NixOS]
-- **Rationale:** [one paragraph]
-- **CUDA plan:** [specific packages, overlay approach, driver pinning strategy]
-- **Atomic update plan:** [ostree layering | NixOS generations]
-- **First-boot wizard plan:** [Anaconda | Calamares + custom | NixOS custom]
+1. **GPU tier timing:** Post-M6 upgrade. M6 ships CPU-only (`gigaos` image). GPU is `gigaos-gpu` parallel build.
+2. **Installer investment:** Custom NixOS-based installer (M6 scope). Calamares fallback available.
+3. **Team familiarity:** Yes — GigaNixOS VM at 192.168.1.148 is the reference; config patterns are established.

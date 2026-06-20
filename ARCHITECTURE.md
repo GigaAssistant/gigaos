@@ -152,18 +152,33 @@ the storage harness. The harness is the boundary where fuzziness ends and correc
 
 **Persistence model:**
 Hallucinated UI starts ephemeral — regenerated fresh each session, no state saved.
-A user can save a generated surface: this promotes it from ephemeral to durable.
-Saved = stored as a named, versioned template in the storage harness.
-Durable templates are deterministic resources — they are not re-hallucinated on load.
+A user can promote a generated surface to durable (`remember`), or remove it from the active
+generation (`forget`). `gc` is the only truly irreversible operation.
 
-State transition:
+State transitions:
 ```
-Ephemeral UI  →  [save command]  →  DurableTemplate (stored in StorageHarness)
-                                         ↓
-                                    [load]  →  Deterministic render
+                            [think]
+                               ↓
+                      session buffer only
+                      (no footprint, stateless)
+
+Ephemeral UI  →  [remember]  →  DurableTemplate (stored in StorageHarness)
+                                      ↓
+                                 [load]  →  Deterministic render (not re-hallucinated)
+                                      ↓
+                               [forget]  →  New generation (template excluded)
+                                                  ↓
+                                             [gc]  →  Permanent deletion (irreversible)
 ```
 
-Once saved, the template is real. It obeys the same rules as any other durable primitive.
+- `think` — stateless. Output lives in the session buffer only. No template created, no generation produced.
+- `remember` — promotes EphemeralView to DurableTemplate. Stored in the storage harness. Versioned.
+- `forget` — creates a new NixOS-style generation that excludes the named template. The template still
+  exists in prior generations. Rollback is free until `gc` runs.
+- `gc` — garbage-collects unreferenced generations. The only operation that permanently deletes templates.
+
+Once saved via `remember`, the template is a real durable primitive. It obeys the same rules as any
+other durable resource: content-addressed, versioned, deterministic on load.
 
 ---
 
@@ -211,6 +226,44 @@ checks but because it does not hold those capability types.
 
 This is the type-discipline guardrail applied to security. Invalid capability combinations
 are unrepresentable, not just forbidden.
+
+---
+
+## NL Terminal Modes
+
+The NL terminal has three primitive interaction modes. These are irreducible (Minimality guardrail):
+none can be expressed in terms of the others.
+
+| Mode | Primitive | Footprint | Reversible |
+|---|---|---|---|
+| `think` | Stateless reasoning, exploration, hallucination | Session buffer only; no template, no generation | N/A — nothing persisted |
+| `remember` | Promote EphemeralView → DurableTemplate | Stored in storage harness; new generation | Yes — `forget` reverses it |
+| `forget` | Exclude DurableTemplate from active generation | New generation produced; prior generations intact | Yes — roll back to prior generation |
+
+**`gc`** is not a terminal mode — it is a maintenance operation that permanently deletes unreferenced
+generations. It is the only irreversible act in the persistence model.
+
+The terminal presents these as natural language operations, not explicit commands. The NL parser
+maps user intent to one of the three modes plus optional target context.
+
+---
+
+## Deployment Modes
+
+GigaOS ships in four hardware tiers. All tiers share the same harness bus, same NL terminal,
+same capability model, same NixOS base. The only difference is which AiService backend is wired
+into the slot at boot.
+
+| Tier | Name | AI Backend | Hardware |
+|---|---|---|---|
+| 0 | GigaOS | Claude API (remote) + CPU fast-path | Any machine; no GPU required |
+| 1 | GigaOS+ | Ollama 14B local | Mid-range machine; 16GB+ RAM |
+| 2 | Giga²OS | vLLM 70B | Dedicated GPU box; NVIDIA A100/3090 class |
+| 3 | Giga³OS | Multi-GPU tensor-parallel | Multi-GPU rack; enterprise inference |
+
+Upgrading from Tier 0 to Tier 1+ is a backend substitution at the `AiService` slot.
+No harness code changes. No capability model changes. No NL terminal changes.
+The appliance config (`services.gigaos.aiBackend`) selects the tier.
 
 ---
 

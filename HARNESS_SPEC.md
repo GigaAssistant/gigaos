@@ -332,6 +332,176 @@ Network calls go through the bus. The AI service cannot make network calls direc
 
 ---
 
+## NL Terminal Modes (M1)
+
+The NL terminal exposes three primitive modes that map to bus operations. These are specified
+here because they have typed representations in the bus protocol.
+
+### `think` — Stateless Inference
+
+```rust
+pub struct ThinkRequest {
+    pub prompt: String,
+    pub session_context: SessionContext,
+}
+
+pub struct ThinkResponse {
+    pub content: String,
+    // No TemplateId — nothing persisted
+}
+```
+
+Stateless. No template created, no generation produced. Output lives in the session buffer only.
+The session buffer is not written to the storage harness. When the session ends, `think` output
+is gone. This is the ephemeral mode — full hallucination with no footprint.
+
+### `remember` — Promote to DurableTemplate
+
+```rust
+pub struct RememberRequest {
+    pub view: EphemeralView,
+    pub name: TemplateName,       // axiomatic name (see NAMING.md)
+    pub capability: StorageWriteCapability,
+}
+
+pub struct RememberResponse {
+    pub template_id: TemplateId,  // content-addressed hash
+    pub generation: GenerationId,
+}
+```
+
+Promotes an `EphemeralView` to a `DurableTemplate` stored in the storage harness.
+Produces a new NixOS-style generation that includes the new template.
+The template is content-addressed — identical content produces the same `TemplateId`.
+
+### `forget` — Exclude from Active Generation
+
+```rust
+pub struct ForgetRequest {
+    pub template_id: TemplateId,
+    pub capability: StorageWriteCapability,
+}
+
+pub struct ForgetResponse {
+    pub generation: GenerationId,  // new generation without this template
+    pub prior_generation: GenerationId,
+}
+```
+
+Creates a new generation that excludes the named template. The template still exists in prior
+generations. Rollback is free: switch back to `prior_generation`. The template is NOT deleted.
+`forget` is reversible until `gc` runs.
+
+### `gc` — Garbage Collect (irreversible)
+
+```rust
+pub struct GcRequest {
+    pub keep_generations: u32,     // how many prior generations to preserve
+    pub capability: StorageWriteCapability,
+}
+```
+
+Permanently deletes unreferenced generations and the templates they exclusively hold.
+The only irreversible operation in the persistence model. `gc` is a maintenance op, not a
+terminal mode — it requires explicit invocation, not triggered by normal use.
+
+### Full Persistence State Machine
+
+```
+                         [think]
+                            ↓
+                   session buffer only
+                   (no harness call, no generation)
+
+EphemeralView  →  [remember]  →  DurableTemplate  →  [forget]  →  New generation (template excluded)
+                                      ↑                                    ↓
+                                   [load]                           [rollback to prior gen]
+                                      ↓                                    ↓
+                              Deterministic render              [gc]  →  Permanent deletion
+```
+
+---
+
+## Context Service Slot (M2)
+
+The context service is a typed, swappable slot for loading session context.
+This is the backend that decides how prior work, semantic memory, and embeddings are retrieved.
+The caller (NL terminal) sees a single `ContextService` trait — the backend is internal.
+
+```rust
+pub trait ContextService: Send + Sync {
+    fn load_context(
+        &self,
+        query: &str,
+        budget: ContextBudget,
+    ) -> impl Future<Output = ContextResult> + Send;
+}
+
+pub struct ContextBudget {
+    pub max_tokens: u32,
+    pub max_results: u32,
+}
+
+pub struct ContextResult {
+    pub entries: Vec<ContextEntry>,
+    pub total_tokens: u32,
+}
+
+pub enum ContextBackend {
+    Null,
+    Qdrant(QdrantContextService),     // semantic/vector search; requires daemon
+    SqliteFts(SqliteContextService),  // lightweight FTS; no daemon, embedded
+    Custom(Box<dyn ContextService>),
+}
+```
+
+**Backend selection guidance:**
+- `Null` — bare install, no context loading. NL terminal still works; no semantic recall.
+- `SqliteFts` — default for GigaOS Tier 0/1. Embedded, no separate service, fast startup.
+- `Qdrant` — GigaOS Tier 2+. Better semantic search for large context stores. Requires daemon.
+
+The backend is configured in the NixOS appliance config:
+```nix
+services.gigaos.contextBackend = "sqlite-fts";  # or "qdrant"
+```
+
+---
+
+## Observability: Langfuse Tracing (M1)
+
+Every inference request passing through the AI service slot is traced to Langfuse.
+This is an M1 deliverable — not optional, not M4. The bus must be observable from day one.
+
+```rust
+pub struct LangfuseTracer {
+    client: LangfuseClient,
+    project_id: String,
+}
+
+impl LangfuseTracer {
+    pub fn trace_inference(&self, req: &Prompt, result: &AiResult, latency_ms: u64) -> TraceId;
+    pub fn trace_bus_dispatch(&self, op: &str, capability: &str, latency_ms: u64) -> SpanId;
+}
+```
+
+The tracer is injected into the `AiService` slot at construction. Every `infer()` call emits:
+- Input prompt (system + messages)
+- Output (message or tool call)
+- Token counts (input / output)
+- Latency
+
+Every bus dispatch emits:
+- Harness op type
+- Capability token used
+- Result (success / error)
+- Latency
+
+This gives an **observable reduction history**: every intent → dispatch → result chain is
+recorded. Debugging a misbehaving session means reading the Langfuse trace, not adding print
+statements. The trace is the source of truth for what the system actually did.
+
+---
+
 ## AI Reliability Design (M4)
 
 ### Job Queue

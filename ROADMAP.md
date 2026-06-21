@@ -47,6 +47,15 @@ through the bus.
 - [ ] `cargo test` — integration test passes, bus path verified end-to-end
 - [ ] Live demo: `"open my notes folder"` → real directory listing printed
 - [ ] Clippy passes
+- [ ] **Anti-hardcode rule:** ≥2 phrasings × ≥2 targets all pass
+  (`"open my notes folder"`, `"show me Documents"`, `"list downloads"` — no special-casing)
+- [ ] **Sentinel file check:** fixture directory with known exact contents; test asserts exact
+  match — proves the listing came from the filesystem, not the model
+- [ ] **Bus instrumentation:** recording/mock StorageHarness asserts capability was invoked
+  with correct typed args (not "output looks right" — the bus path must be verified)
+- [ ] **Negative case:** nonexistent folder → typed error surfaces to terminal (no panic, no hang)
+- [ ] **Least-privilege check:** a destructive-intent request cannot reach any write/delete
+  capability (none registered) — proves capability gating from day one
 
 **M1 AI backend: Claude API hardcoded.** Local inference setup is M4. If "AI service" means
 "stand up local Qwen," the estimate explodes. Pin the backend to Claude API until the bus
@@ -208,14 +217,21 @@ completions, routine dispatch). Claude API remains the fallback for complex reas
 Two-tier routing lives in the `OllamaService` impl — callers see a single `AiService`.
 
 ### Tier 2 — Giga²OS (Local 70B GPU)
-**Backend:** vLLM running a 70B parameter model (e.g., Qwen-72B, Llama-3-70B)  
+**Backend:** Ollama or llama.cpp with a 70B parameter model (e.g., Qwen-72B, Llama-3-70B)  
 **Hardware:** NVIDIA GPU, A100/RTX 3090 class. CUDA required.  
-**Ships:** Post-M6, after `gigaos-gpu` NixOS image validated in CI  
-**NixOS config:** `services.gigaos.aiBackend = "vllm-70b"; nixpkgs.config.allowUnfree = true;`
+**Ships:** Post-M6, after CUDA validated on actual GPU hardware AND `gigaos-gpu` NixOS image passes CI  
+**NixOS config:** `services.gigaos.aiBackend = "ollama-70b"; nixpkgs.config.allowUnfree = true;`
 
 Full local inference for all operations. Claude API becomes optional fallback only.
-The `gigaos-gpu` appliance image (NixOS with CUDA overlay, pinned driver version) is the
-build target. CUDA finickiness is quarantined to this image — it does not affect Tier 0/1.
+Runtime is pinned to Ollama or llama.cpp — vLLM is explicitly excluded. vLLM's
+torch/CUDA/wheel dependency tree conflicts with Nix purity and represents a genuine
+integration fight, not a minor hurdle. Ollama (`acceleration = "cuda"`) and llama.cpp
+(`cudaSupport`) on Nix are proven paths.
+
+**CUDA prerequisite:** Validate working GPU inference on the actual target hardware before
+committing to the `gigaos-gpu` image. The GigaNixOS box at 192.168.1.148 is currently CPU-only;
+this must be closed before Tier 2 can be considered validated. "Works in theory on NixOS CUDA"
+is not a substitute for a working demo on the physical card with the actual driver version.
 
 ### Tier 3 — Giga³OS (Multi-GPU)
 **Backend:** Tensor-parallel inference across multiple GPUs  
@@ -232,7 +248,7 @@ Same harness interface as all other tiers. Multi-GPU parallelism is internal to 
 
 ```
 GigaOS (Tier 0)  →  GigaOS+ (Tier 1)  →  Giga²OS (Tier 2)  →  Giga³OS (Tier 3)
-   Claude API          Ollama 14B            vLLM 70B            Multi-GPU
+   Claude API          Ollama 14B          Ollama/llama.cpp        Multi-GPU
    Any machine         16GB RAM              GPU required         GPU rack
    Ships M6            Post-M6               Post-M6              Future
 ```

@@ -160,25 +160,32 @@ State transitions:
                             [think]
                                ↓
                       session buffer only
-                      (no footprint, stateless)
+                      (no harness call, no generation)
 
-Ephemeral UI  →  [remember]  →  DurableTemplate (stored in StorageHarness)
-                                      ↓
-                                 [load]  →  Deterministic render (not re-hallucinated)
-                                      ↓
-                               [forget]  →  New generation (template excluded)
-                                                  ↓
-                                             [gc]  →  Permanent deletion (irreversible)
+Ephemeral UI  →  dispatch(ContextOp::Save)   →  DurableTemplate (new generation)
+                                                       ↓
+                                              dispatch(ContextOp::Exclude)
+                                                       ↓
+                                              New generation (template excluded)
+                                              Prior generations intact → rollback free
+                                                       ↓
+                                              dispatch(ContextOp::Gc)
+                                                       ↓
+                                              Permanent deletion (irreversible)
 ```
 
-- `think` — stateless. Output lives in the session buffer only. No template created, no generation produced.
-- `remember` — promotes EphemeralView to DurableTemplate. Stored in the storage harness. Versioned.
-- `forget` — creates a new NixOS-style generation that excludes the named template. The template still
-  exists in prior generations. Rollback is free until `gc` runs.
-- `gc` — garbage-collects unreferenced generations. The only operation that permanently deletes templates.
+- `think` — stateless; no harness call, no generation, no footprint.
+- `remember` (user-facing) — syntactic sugar for `dispatch(ContextOp::Save)`. Promotes EphemeralView
+  to DurableTemplate in a single atomic transaction. Produces a new generation.
+- `forget` (user-facing) — syntactic sugar for `dispatch(ContextOp::Exclude)`. New generation excludes
+  the template; prior generations remain intact. Rollback is free.
+- `gc` — `dispatch(ContextOp::Gc)`. Permanently deletes unreferenced generations. The only irreversible op.
 
-Once saved via `remember`, the template is a real durable primitive. It obeys the same rules as any
-other durable resource: content-addressed, versioned, deterministic on load.
+**Rollback addressing:** Always name-addressed (`restore template X v3`), never position-addressed
+(`roll back to generation 47`). Position addressing exposes the non-confluent generation sequence
+as a user-facing primitive — a Confluence violation at the interface.
+
+Once stored, the template is a durable primitive: content-addressed, versioned, deterministic on load.
 
 ---
 
@@ -231,20 +238,20 @@ are unrepresentable, not just forbidden.
 
 ## NL Terminal Modes
 
-The NL terminal has three primitive interaction modes. These are irreducible (Minimality guardrail):
-none can be expressed in terms of the others.
+The NL terminal has two primitive modes (Minimality guardrail — neither composes from the other):
 
-| Mode | Primitive | Footprint | Reversible |
+| Mode | What it does | Harness call | Footprint |
 |---|---|---|---|
-| `think` | Stateless reasoning, exploration, hallucination | Session buffer only; no template, no generation | N/A — nothing persisted |
-| `remember` | Promote EphemeralView → DurableTemplate | Stored in storage harness; new generation | Yes — `forget` reverses it |
-| `forget` | Exclude DurableTemplate from active generation | New generation produced; prior generations intact | Yes — roll back to prior generation |
+| `think` | Stateless reasoning / hallucination | None | Session buffer only |
+| `dispatch` | Deterministic harness execution | Required | Depends on harness op |
 
-**`gc`** is not a terminal mode — it is a maintenance operation that permanently deletes unreferenced
-generations. It is the only irreversible act in the persistence model.
+User-facing `remember` and `forget` keywords are syntactic sugar. They resolve to
+`dispatch(ContextOp::Save)` and `dispatch(ContextOp::Exclude)` at the bus. Memory effects
+and filesystem effects are both dispatched — neither is privileged as a primitive.
 
-The terminal presents these as natural language operations, not explicit commands. The NL parser
-maps user intent to one of the three modes plus optional target context.
+**Deterministic lookup rule:** `"What did I save as X?"` must route to `dispatch`, not `think`.
+Putting a hallucinating model in front of a deterministic retrieval violates the quality rule.
+The NL parser routes intent-to-recall to dispatch directly, bypassing inference.
 
 ---
 

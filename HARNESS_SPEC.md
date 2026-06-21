@@ -334,8 +334,19 @@ Network calls go through the bus. The AI service cannot make network calls direc
 
 ## NL Terminal Modes (M1)
 
-The NL terminal exposes three primitive modes that map to bus operations. These are specified
-here because they have typed representations in the bus protocol.
+The NL terminal has two primitive modes. These are irreducible (Minimality guardrail):
+neither can be expressed in terms of the other.
+
+| Mode | What it does | Harness call | Footprint |
+|---|---|---|---|
+| `think` | Stateless reasoning / hallucination | None | Session buffer only |
+| `dispatch` | Deterministic harness execution | Required | Depends on harness op |
+
+`remember` and `forget` are **not** independent primitives — they are `dispatch` operations
+against the ContextService harness (`ContextOp::Save` and `ContextOp::Exclude`). Elevating
+them to primitive status would privilege memory effects over filesystem effects without
+justification, violating Minimality. User-facing `remember`/`forget` keywords in the NL
+terminal are syntactic sugar that the parser resolves to the appropriate `dispatch` call.
 
 ### `think` — Stateless Inference
 
@@ -347,65 +358,41 @@ pub struct ThinkRequest {
 
 pub struct ThinkResponse {
     pub content: String,
-    // No TemplateId — nothing persisted
+    // No TemplateId — nothing persisted, no harness call made
 }
 ```
 
-Stateless. No template created, no generation produced. Output lives in the session buffer only.
-The session buffer is not written to the storage harness. When the session ends, `think` output
-is gone. This is the ephemeral mode — full hallucination with no footprint.
+Stateless. No harness call, no template, no generation. Output lives in the session buffer only.
+The session buffer is NOT written to the storage harness. When the session ends, `think` output
+is gone — full hallucination, zero footprint.
 
-### `remember` — Promote to DurableTemplate
+**Critical boundary:** deterministic lookup (`recall`) must NOT go through `think`.
+`"What did I save as X?"` is a `dispatch(ContextOp::Get { name })` — a harness call returning
+real stored content. Routing it through `think` would put a hallucinating model in front of a
+deterministic lookup, violating the quality rule. The NL parser must route intent-to-recall
+directly to dispatch, never through think.
+
+### `dispatch` — Deterministic Harness Execution
+
+All world-effect operations go through `dispatch`: filesystem, settings, services, and
+ContextService operations (save/exclude/get). The same bus protocol applies to all:
 
 ```rust
-pub struct RememberRequest {
-    pub view: EphemeralView,
-    pub name: TemplateName,       // axiomatic name (see NAMING.md)
-    pub capability: StorageWriteCapability,
-}
-
-pub struct RememberResponse {
-    pub template_id: TemplateId,  // content-addressed hash
-    pub generation: GenerationId,
+pub trait HarnessBus: Send + Sync {
+    fn dispatch<T: HarnessOp>(
+        &self,
+        request: Request<T>,
+    ) -> impl Future<Output = Result<Response<T>, BusError>> + Send;
 }
 ```
 
-Promotes an `EphemeralView` to a `DurableTemplate` stored in the storage harness.
-Produces a new NixOS-style generation that includes the new template.
-The template is content-addressed — identical content produces the same `TemplateId`.
-
-### `forget` — Exclude from Active Generation
-
-```rust
-pub struct ForgetRequest {
-    pub template_id: TemplateId,
-    pub capability: StorageWriteCapability,
-}
-
-pub struct ForgetResponse {
-    pub generation: GenerationId,  // new generation without this template
-    pub prior_generation: GenerationId,
-}
-```
-
-Creates a new generation that excludes the named template. The template still exists in prior
-generations. Rollback is free: switch back to `prior_generation`. The template is NOT deleted.
-`forget` is reversible until `gc` runs.
-
-### `gc` — Garbage Collect (irreversible)
-
-```rust
-pub struct GcRequest {
-    pub keep_generations: u32,     // how many prior generations to preserve
-    pub capability: StorageWriteCapability,
-}
-```
-
-Permanently deletes unreferenced generations and the templates they exclusively hold.
-The only irreversible operation in the persistence model. `gc` is a maintenance op, not a
-terminal mode — it requires explicit invocation, not triggered by normal use.
+The NL terminal calls `think` to interpret fuzzy intent into a typed `HarnessOp`, then calls
+`dispatch` to execute it deterministically. These two steps are always sequential: generate
+intent, then execute. Never hallucinate the execution itself.
 
 ### Full Persistence State Machine
+
+The persistence operations (`remember`, `forget`, `gc`) are `dispatch` calls to the ContextService harness.
 
 ```
                          [think]
@@ -413,20 +400,36 @@ terminal mode — it requires explicit invocation, not triggered by normal use.
                    session buffer only
                    (no harness call, no generation)
 
-EphemeralView  →  [remember]  →  DurableTemplate  →  [forget]  →  New generation (template excluded)
-                                      ↑                                    ↓
-                                   [load]                           [rollback to prior gen]
-                                      ↓                                    ↓
-                              Deterministic render              [gc]  →  Permanent deletion
+EphemeralView  →  dispatch(ContextOp::Save)   →  DurableTemplate (stored, new generation)
+                                                        ↓
+                                               dispatch(ContextOp::Exclude)
+                                                        ↓
+                                               New generation (template excluded)
+                                               Prior generations intact → rollback free
+                                                        ↓
+                                               dispatch(ContextOp::Gc)
+                                                        ↓
+                                               Permanent deletion (irreversible)
 ```
+
+**Rollback addressing rule:** Rollback is always name-addressed (`restore template X v3`),
+never position-addressed (`roll back to generation 47`). Exposing generation indices as a
+user-facing primitive would surface the non-confluent history ordering — a Confluence violation
+at the interface level.
 
 ---
 
 ## Context Service Slot (M2)
 
-The context service is a typed, swappable slot for loading session context.
-This is the backend that decides how prior work, semantic memory, and embeddings are retrieved.
-The caller (NL terminal) sees a single `ContextService` trait — the backend is internal.
+The ContextService harness handles all persistent context: session memory, semantic recall,
+template storage. It is a typed slot — the NL terminal sees a single `ContextService` trait.
+
+**Design constraint (Minimality + Confluence):** A single SQLite backend is required.
+Two stores (Qdrant + SQLite) would fail both tests: (1) Qdrant's vector capability is
+composable from SQLite + sqlite-vec, so it fails Minimality; (2) dual-write for every
+`remember`/`forget` creates a distributed consistency problem — atomic in one store, orphaned
+in the other, a latent Confluence violation inside the terminal primitives. A single SQLite
+file makes `remember`/`forget` single atomic transactions.
 
 ```rust
 pub trait ContextService: Send + Sync {
@@ -435,6 +438,11 @@ pub trait ContextService: Send + Sync {
         query: &str,
         budget: ContextBudget,
     ) -> impl Future<Output = ContextResult> + Send;
+
+    fn save(&self, name: FourSegmentName, view: EphemeralView) -> impl Future<Output = TemplateId> + Send;
+    fn exclude(&self, name: FourSegmentName) -> impl Future<Output = GenerationId> + Send;
+    fn gc(&self, keep_generations: u32) -> impl Future<Output = ()> + Send;
+    fn get(&self, name: FourSegmentName) -> impl Future<Output = Option<DurableTemplate>> + Send;
 }
 
 pub struct ContextBudget {
@@ -449,20 +457,19 @@ pub struct ContextResult {
 
 pub enum ContextBackend {
     Null,
-    Qdrant(QdrantContextService),     // semantic/vector search; requires daemon
-    SqliteFts(SqliteContextService),  // lightweight FTS; no daemon, embedded
+    Sqlite(SqliteContextService),  // FTS5 (lexical) + sqlite-vec (vector) — single file, no daemon
     Custom(Box<dyn ContextService>),
 }
 ```
 
-**Backend selection guidance:**
-- `Null` — bare install, no context loading. NL terminal still works; no semantic recall.
-- `SqliteFts` — default for GigaOS Tier 0/1. Embedded, no separate service, fast startup.
-- `Qdrant` — GigaOS Tier 2+. Better semantic search for large context stores. Requires daemon.
+**SQLite backend:** FTS5 provides lexical full-text search; sqlite-vec provides dense vector
+search (semantic recall). Both run in the same file, same transaction, no daemon. Single
+portable file. `Custom` is the extension point for future backends (e.g., remote sync).
+Qdrant is not in scope — re-evaluate only with a measured QPS argument at appliance scale.
 
 The backend is configured in the NixOS appliance config:
 ```nix
-services.gigaos.contextBackend = "sqlite-fts";  # or "qdrant"
+services.gigaos.contextBackend = "sqlite";
 ```
 
 ---
